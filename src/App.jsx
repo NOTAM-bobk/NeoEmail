@@ -1,1063 +1,880 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Mail, Send, PenSquare, LogOut, ArrowLeft, RefreshCw, AlertTriangle,
   Search, Star, Inbox, FileText, ChevronLeft, ChevronRight, Reply,
-  Trash2, Archive, X, Check, Menu, Paperclip, Clock, Filter
+  Trash2, X, Check, Menu, Archive, Eye, EyeOff, Forward, Zap
 } from 'lucide-react';
+
+// ─── Config ────────────────────────────────────────────────────────────────────
 
 const CLIENT_ID = '277464695359-fvqp46kdkqjqvkv0ur0208t0uo349eas.apps.googleusercontent.com';
 const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/gmail.modify',
+  'https://mail.google.com/',
+  'openid',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
 ].join(' ');
 
-const PAGE_SIZE = 15;
+const PAGE_SIZE = 20;
+const TOKEN_COOKIE = 'neomail_token';
+const USER_COOKIE = 'neomail_user';
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Cookie Helpers ─────────────────────────────────────────────────────────────
 
-function decodeBase64(str) {
+function setCookie(name, value, hours = 1) {
+  const exp = new Date(Date.now() + hours * 3600000).toUTCString();
+  document.cookie = `${name}=${encodeURIComponent(value)};expires=${exp};path=/;SameSite=Strict`;
+}
+function getCookie(name) {
+  const m = document.cookie.split(';').find(c => c.trim().startsWith(name + '='));
+  return m ? decodeURIComponent(m.trim().slice(name.length + 1)) : null;
+}
+function deleteCookie(name) {
+  document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/`;
+}
+
+// ─── Gmail Helpers ──────────────────────────────────────────────────────────────
+
+function decodeB64(str) {
+  if (!str) return '';
   try {
     return decodeURIComponent(
       atob(str.replace(/-/g, '+').replace(/_/g, '/'))
-        .split('')
-        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-        .join('')
+        .split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')
     );
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 }
 
-function getEmailBody(payload) {
-  if (!payload) return '';
-  const findPart = (parts, mimeType) => {
+function getBody(payload) {
+  if (!payload) return { text: '' };
+  const find = (parts, type) => {
     if (!parts) return null;
-    for (const part of parts) {
-      if (part.mimeType === mimeType && part.body?.data) return part.body.data;
-      if (part.parts) {
-        const found = findPart(part.parts, mimeType);
-        if (found) return found;
-      }
+    for (const p of parts) {
+      if (p.mimeType === type && p.body?.data) return p.body.data;
+      if (p.parts) { const f = find(p.parts, type); if (f) return f; }
     }
     return null;
   };
-  if (payload.mimeType === 'text/html' && payload.body?.data) return { html: decodeBase64(payload.body.data) };
-  if (payload.mimeType === 'text/plain' && payload.body?.data) return { text: decodeBase64(payload.body.data) };
-  const html = findPart(payload.parts, 'text/html');
-  if (html) return { html: decodeBase64(html) };
-  const text = findPart(payload.parts, 'text/plain');
-  if (text) return { text: decodeBase64(text) };
+  if (payload.mimeType === 'text/html' && payload.body?.data) return { html: decodeB64(payload.body.data) };
+  if (payload.mimeType === 'text/plain' && payload.body?.data) return { text: decodeB64(payload.body.data) };
+  const h = find(payload.parts, 'text/html');
+  if (h) return { html: decodeB64(h) };
+  const t = find(payload.parts, 'text/plain');
+  if (t) return { text: decodeB64(t) };
   return { text: '' };
 }
 
-function getHeader(headers, name) {
+function hdr(headers, name) {
   return headers?.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || '';
 }
 
-function formatDate(internalDate) {
-  if (!internalDate) return '';
-  const d = new Date(parseInt(internalDate));
-  const now = new Date();
-  const isToday = d.toDateString() === now.toDateString();
-  if (isToday) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  const isThisYear = d.getFullYear() === now.getFullYear();
-  if (isThisYear) return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' });
+function fmtDate(ts) {
+  if (!ts) return '';
+  const d = new Date(parseInt(ts)), now = new Date(), diff = now - d;
+  if (diff < 86400000 && d.toDateString() === now.toDateString())
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (diff < 604800000) return d.toLocaleDateString([], { weekday: 'short' });
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: d.getFullYear() !== now.getFullYear() ? '2-digit' : undefined }).replace(/ undefined/, '');
 }
 
-function formatSender(from) {
-  if (!from) return 'Unknown';
-  const match = from.match(/^"?([^"<]+)"?\s*</);
-  return match ? match[1].trim() : from.split('@')[0];
+function fmtSender(from) {
+  if (!from) return '?';
+  const m = from.match(/^"?([^"<]+)"?\s*</);
+  return m ? m[1].trim() : from.split('@')[0];
+}
+
+function encodeRaw(content) {
+  return btoa(unescape(encodeURIComponent(content)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// ─── API Class ──────────────────────────────────────────────────────────────────
+
+class Gmail {
+  constructor(tok) { this.tok = tok; }
+  async req(path, opts = {}) {
+    const r = await fetch(`https://gmail.googleapis.com/gmail/v1${path}`, {
+      ...opts,
+      headers: { Authorization: `Bearer ${this.tok}`, 'Content-Type': 'application/json', ...opts.headers },
+    });
+    if (!r.ok) throw new Error(`${r.status}`);
+    return r.json();
+  }
+  list(q, pt) {
+    let u = `/users/me/messages?maxResults=${PAGE_SIZE}&q=${encodeURIComponent(q)}`;
+    if (pt) u += `&pageToken=${pt}`;
+    return this.req(u);
+  }
+  getMeta(id) {
+    return this.req(`/users/me/messages/${id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Date&metadataHeaders=Cc`);
+  }
+  getFull(id) { return this.req(`/users/me/messages/${id}?format=full`); }
+  modify(id, body) { return this.req(`/users/me/messages/${id}/modify`, { method: 'POST', body: JSON.stringify(body) }); }
+  trash(id) { return this.req(`/users/me/messages/${id}/trash`, { method: 'POST' }); }
+  send(raw, threadId) {
+    const body = { raw };
+    if (threadId) body.threadId = threadId;
+    return this.req('/users/me/messages/send', { method: 'POST', body: JSON.stringify(body) });
+  }
+  profile() { return this.req('/users/me/profile'); }
 }
 
 // ─── Toast ─────────────────────────────────────────────────────────────────────
 
 function Toast({ message, type, onClose }) {
-  useEffect(() => {
-    const t = setTimeout(onClose, 3000);
-    return () => clearTimeout(t);
-  }, [onClose]);
+  useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
   return (
     <div className={`toast toast-${type}`}>
-      {type === 'success' ? <Check size={16} /> : <AlertTriangle size={16} />}
+      {type === 'success' ? <Check size={13} /> : <AlertTriangle size={13} />}
       {message}
     </div>
   );
 }
 
-// ─── Sidebar ───────────────────────────────────────────────────────────────────
+// ─── Folders ────────────────────────────────────────────────────────────────────
 
-function Sidebar({ folder, setFolder, unreadCount, sidebarOpen, setSidebarOpen }) {
-  const nav = [
-    { id: 'inbox', label: 'Inbox', icon: Inbox, badge: unreadCount },
-    { id: 'sent', label: 'Sent', icon: Send },
-    { id: 'drafts', label: 'Drafts', icon: FileText },
-    { id: 'starred', label: 'Starred', icon: Star },
-  ];
+const FOLDERS = [
+  { id: 'inbox',   label: 'Inbox',   icon: Inbox,    q: 'in:inbox' },
+  { id: 'starred', label: 'Starred', icon: Star,     q: 'is:starred' },
+  { id: 'sent',    label: 'Sent',    icon: Send,     q: 'in:sent' },
+  { id: 'drafts',  label: 'Drafts',  icon: FileText, q: 'in:drafts' },
+  { id: 'archive', label: 'Archive', icon: Archive,  q: 'in:archive' },
+  { id: 'trash',   label: 'Trash',   icon: Trash2,   q: 'in:trash' },
+];
+
+// ─── Sidebar ────────────────────────────────────────────────────────────────────
+
+function Sidebar({ folder, setFolder, unread, open, onClose, onCompose, onLogout, userEmail }) {
   return (
     <>
-      {sidebarOpen && <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)} />}
-      <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
-        <div className="sidebar-logo">
-          <div className="logo-icon"><Mail size={18} /></div>
-          <span className="logo-text">NEOMAIL</span>
+      {open && <div className="overlay" onClick={onClose} />}
+      <aside className={`sidebar ${open ? 'open' : ''}`}>
+        <div className="sb-head">
+          <div className="sb-logo">
+            <img src="mail.png" alt="" className="sb-img" onError={e => e.target.style.display='none'} />
+            <Mail size={16} className="sb-mail-ico" />
+            <span>NEOMAIL</span>
+          </div>
+          <button className="ib close-btn" onClick={onClose}><X size={15} /></button>
         </div>
-        <nav className="sidebar-nav">
-          {nav.map(({ id, label, icon: Icon, badge }) => (
-            <button
-              key={id}
-              className={`nav-item ${folder === id ? 'nav-item-active' : ''}`}
-              onClick={() => { setFolder(id); setSidebarOpen(false); }}
-            >
-              <Icon size={16} />
-              <span>{label}</span>
-              {badge > 0 && <span className="nav-badge">{badge > 99 ? '99+' : badge}</span>}
+        <button className="compose-sb-btn" onClick={() => { onCompose(); onClose(); }}>
+          <PenSquare size={14} /> Compose
+        </button>
+        <nav className="sb-nav">
+          {FOLDERS.map(({ id, label, icon: Icon }) => (
+            <button key={id} className={`ni ${folder === id ? 'ni-active' : ''}`}
+              onClick={() => { setFolder(id); onClose(); }}>
+              <Icon size={14} /><span>{label}</span>
+              {id === 'inbox' && unread > 0 && <span className="ni-badge">{unread > 99 ? '99+' : unread}</span>}
             </button>
           ))}
         </nav>
+        <div className="sb-foot">
+          {userEmail && <div className="sb-email">{userEmail}</div>}
+          <button className="ni" onClick={onLogout}><LogOut size={14} /><span>Sign out</span></button>
+        </div>
       </aside>
     </>
   );
 }
 
-// ─── Email List Item ───────────────────────────────────────────────────────────
+// ─── Email Row ──────────────────────────────────────────────────────────────────
 
-function EmailRow({ email, onOpen, onStar, onDelete }) {
-  const isUnread = email.labelIds?.includes('UNREAD');
-  const isStarred = email.labelIds?.includes('STARRED');
+function Row({ email, sel, onOpen, onStar, onDelete, onArchive, onToggleRead }) {
+  const unread   = email.labelIds?.includes('UNREAD');
+  const starred  = email.labelIds?.includes('STARRED');
   return (
-    <div className={`email-row ${isUnread ? 'email-row-unread' : ''}`} onClick={() => onOpen(email)}>
-      <button
-        className={`star-btn ${isStarred ? 'star-active' : ''}`}
-        onClick={e => { e.stopPropagation(); onStar(email); }}
-      >
-        <Star size={14} fill={isStarred ? 'currentColor' : 'none'} />
+    <div className={`row ${unread ? 'row-u' : ''} ${sel ? 'row-sel' : ''}`} onClick={() => onOpen(email)}>
+      <button className={`star-b ${starred ? 'star-on' : ''}`} onClick={e => { e.stopPropagation(); onStar(email); }}>
+        <Star size={12} fill={starred ? 'currentColor' : 'none'} />
       </button>
-      <div className="row-sender">{formatSender(email.from)}</div>
-      <div className="row-subject-group">
-        <span className="row-subject">{email.subject || '(No Subject)'}</span>
-        <span className="row-snippet">{email.snippet}</span>
+      <div className="row-av">{fmtSender(email.from)[0]?.toUpperCase() || '?'}</div>
+      <div className="row-body">
+        <div className="row-t1">
+          <span className="row-from">{fmtSender(email.from)}</span>
+          <span className="row-date">{fmtDate(email.internalDate)}</span>
+        </div>
+        <div className="row-sub">{email.subject}</div>
+        <div className="row-snip">{email.snippet}</div>
       </div>
-      <div className="row-meta">
-        <span className="row-date">{formatDate(email.internalDate)}</span>
-        <button className="delete-btn" onClick={e => { e.stopPropagation(); onDelete(email); }}>
-          <Trash2 size={13} />
+      <div className="row-acts" onClick={e => e.stopPropagation()}>
+        <button className="ra-btn" title="Archive" onClick={() => onArchive(email)}><Archive size={12} /></button>
+        <button className="ra-btn" title={unread ? 'Mark read' : 'Mark unread'} onClick={() => onToggleRead(email)}>
+          {unread ? <Eye size={12} /> : <EyeOff size={12} />}
         </button>
+        <button className="ra-btn ra-del" title="Delete" onClick={() => onDelete(email)}><Trash2 size={12} /></button>
       </div>
     </div>
   );
 }
 
-// ─── Email Detail ──────────────────────────────────────────────────────────────
+// ─── Detail ─────────────────────────────────────────────────────────────────────
 
-function EmailDetail({ email, onBack, onReply, onDelete, onStar }) {
-  const [replyOpen, setReplyOpen] = useState(false);
-  const [replyBody, setReplyBody] = useState('');
-  const [replySending, setReplySending] = useState(false);
+function Detail({ email, onBack, onReply, onForward, onDelete, onStar, onToggleRead, mobile }) {
+  const [reply,   setReply]   = useState(false);
+  const [fwd,     setFwd]     = useState(false);
+  const [rBody,   setRBody]   = useState('');
+  const [fTo,     setFTo]     = useState('');
+  const [fBody,   setFBody]   = useState('');
+  const [busy,    setBusy]    = useState(false);
+  const ifrRef = useRef(null);
 
-  const body = getEmailBody(email.payload);
-  const isStarred = email.labelIds?.includes('STARRED');
+  const body    = getBody(email.payload);
+  const starred = email.labelIds?.includes('STARRED');
+  const unread  = email.labelIds?.includes('UNREAD');
 
-  const handleReply = async () => {
-    if (!replyBody.trim()) return;
-    setReplySending(true);
-    await onReply(email, replyBody);
-    setReplyBody('');
-    setReplyOpen(false);
-    setReplySending(false);
+  const doReply = async () => {
+    if (!rBody.trim()) return;
+    setBusy(true);
+    try { await onReply(email, rBody); setRBody(''); setReply(false); }
+    finally { setBusy(false); }
+  };
+  const doFwd = async () => {
+    if (!fTo.trim()) return;
+    setBusy(true);
+    try { await onForward(email, fTo, fBody); setFTo(''); setFBody(''); setFwd(false); }
+    finally { setBusy(false); }
   };
 
   return (
-    <div className="detail-panel">
-      <div className="detail-header">
-        <button className="icon-btn" onClick={onBack}><ArrowLeft size={18} /></button>
-        <div className="detail-actions">
-          <button className={`icon-btn ${isStarred ? 'star-active' : ''}`} onClick={() => onStar(email)}>
-            <Star size={16} fill={isStarred ? 'currentColor' : 'none'} />
-          </button>
-          <button className="icon-btn" onClick={() => setReplyOpen(r => !r)}>
-            <Reply size={16} />
-          </button>
-          <button className="icon-btn danger-btn" onClick={() => onDelete(email)}>
-            <Trash2 size={16} />
-          </button>
+    <div className="det">
+      <div className="det-bar">
+        {mobile && <button className="ib" onClick={onBack}><ArrowLeft size={17} /></button>}
+        <div className="det-acts">
+          <button className={`ib ${starred ? 'star-on' : ''}`} onClick={() => onStar(email)} title="Star"><Star size={14} fill={starred ? 'currentColor' : 'none'} /></button>
+          <button className="ib" onClick={() => onToggleRead(email)} title={unread ? 'Mark read' : 'Mark unread'}>{unread ? <Eye size={14}/> : <EyeOff size={14}/>}</button>
+          <button className="ib" onClick={() => { setReply(r => !r); setFwd(false); }} title="Reply"><Reply size={14} /></button>
+          <button className="ib" onClick={() => { setFwd(f => !f); setReply(false); }} title="Forward"><Forward size={14} /></button>
+          <button className="ib ib-del" onClick={() => onDelete(email)} title="Delete"><Trash2 size={14} /></button>
         </div>
       </div>
-
-      <div className="detail-subject">{email.subject || '(No Subject)'}</div>
-
-      <div className="detail-meta-row">
-        <div className="detail-avatar">{formatSender(email.from)[0]?.toUpperCase()}</div>
-        <div className="detail-from-block">
-          <span className="detail-from-name">{formatSender(email.from)}</span>
-          <span className="detail-from-addr">{email.from}</span>
+      <div className="det-body">
+        <h1 className="det-subj">{email.subject || '(No Subject)'}</h1>
+        <div className="det-meta">
+          <div className="det-av">{fmtSender(email.from)[0]?.toUpperCase()}</div>
+          <div className="det-meta-txt">
+            <div className="det-from">{fmtSender(email.from)}</div>
+            <div className="det-addr">{email.from}</div>
+            {email.to && <div className="det-addr">To: {email.to}</div>}
+          </div>
+          <div className="det-dt">{fmtDate(email.internalDate)}</div>
         </div>
-        <span className="detail-date">{formatDate(email.internalDate)}</span>
-      </div>
+        <div className="det-content">
+          {body.html ? (
+            <iframe
+              ref={ifrRef}
+              title="email"
+              srcDoc={`<base target="_blank"><style>*{box-sizing:border-box}body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.65;color:#111;margin:0;padding:0;word-break:break-word}a{color:#0052ff}img{max-width:100%;height:auto}table{max-width:100%!important}</style>${body.html}`}
+              sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+              className="ifr"
+              onLoad={e => {
+                try { const h = e.target.contentDocument?.documentElement?.scrollHeight; if(h) e.target.style.height = Math.min(h+32,5000)+'px'; } catch {}
+              }}
+            />
+          ) : (
+            <pre className="det-txt">{body.text || '(No content)'}</pre>
+          )}
+        </div>
 
-      <div className="detail-body">
-        {body.html ? (
-          <iframe
-            title="email-body"
-            srcDoc={`<base target="_blank"><style>body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.6;color:#111;padding:0;margin:0;word-wrap:break-word;}a{color:#0066ff}img{max-width:100%;height:auto}</style>${body.html}`}
-            sandbox="allow-same-origin allow-popups"
-            className="email-iframe"
-            onLoad={e => {
-              const doc = e.target.contentDocument;
-              if (doc) {
-                e.target.style.height = doc.documentElement.scrollHeight + 'px';
-              }
-            }}
-          />
-        ) : (
-          <pre className="email-text">{body.text}</pre>
+        {reply && (
+          <div className="rc">
+            <div className="rc-lbl"><Reply size={12}/> Reply to {fmtSender(email.from)}</div>
+            <textarea className="rc-ta" value={rBody} onChange={e=>setRBody(e.target.value)} placeholder="Write your reply…" rows={5} autoFocus />
+            <div className="rc-foot">
+              <button className="btn-send" onClick={doReply} disabled={busy||!rBody.trim()}>{busy?'Sending…':'Send'} <Send size={12}/></button>
+              <button className="btn-ghost" onClick={()=>setReply(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
+        {fwd && (
+          <div className="rc">
+            <div className="rc-lbl"><Forward size={12}/> Forward</div>
+            <input className="rc-inp" type="email" placeholder="Forward to…" value={fTo} onChange={e=>setFTo(e.target.value)} autoFocus />
+            <textarea className="rc-ta" value={fBody} onChange={e=>setFBody(e.target.value)} placeholder="Add a note (optional)…" rows={4} />
+            <div className="rc-foot">
+              <button className="btn-send" onClick={doFwd} disabled={busy||!fTo.trim()}>{busy?'Sending…':'Forward'} <Forward size={12}/></button>
+              <button className="btn-ghost" onClick={()=>setFwd(false)}>Cancel</button>
+            </div>
+          </div>
         )}
       </div>
-
-      {replyOpen && (
-        <div className="reply-box">
-          <div className="reply-header">
-            <Reply size={14} />
-            <span>Reply to {formatSender(email.from)}</span>
-            <button className="icon-btn ml-auto" onClick={() => setReplyOpen(false)}><X size={14} /></button>
-          </div>
-          <textarea
-            className="reply-textarea"
-            placeholder="Write your reply..."
-            value={replyBody}
-            onChange={e => setReplyBody(e.target.value)}
-            rows={6}
-            autoFocus
-          />
-          <div className="reply-footer">
-            <button
-              className="btn-primary"
-              onClick={handleReply}
-              disabled={replySending || !replyBody.trim()}
-            >
-              {replySending ? 'Sending...' : 'Send Reply'} <Send size={14} />
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
 
-// ─── Compose ───────────────────────────────────────────────────────────────────
+// ─── Compose ────────────────────────────────────────────────────────────────────
 
-function ComposePanel({ token, onBack, onToast }) {
-  const [to, setTo] = useState('');
-  const [subject, setSubject] = useState('');
-  const [body, setBody] = useState('');
-  const [sending, setSending] = useState(false);
+function Compose({ api, onBack, onToast, prefill }) {
+  const [to,      setTo]      = useState(prefill?.to || '');
+  const [cc,      setCc]      = useState(prefill?.cc || '');
+  const [subject, setSubject] = useState(prefill?.subject || '');
+  const [body,    setBody]    = useState(prefill?.body || '');
+  const [showCc,  setShowCc]  = useState(!!prefill?.cc);
+  const [busy,    setBusy]    = useState(false);
 
-  const handleSend = async () => {
-    if (!to || !subject || !body) { onToast('Fill out all fields.', 'error'); return; }
-    setSending(true);
+  const send = async () => {
+    if (!to||!subject||!body) { onToast('Fill all fields.','error'); return; }
+    setBusy(true);
     try {
-      const emailContent = `To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`;
-      const encoded = btoa(unescape(encodeURIComponent(emailContent)))
-        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-      const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ raw: encoded }),
-      });
-      if (!res.ok) throw new Error();
-      onToast('Email sent!', 'success');
+      let h = `To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n`;
+      if (cc) h += `Cc: ${cc}\r\n`;
+      await api.send(encodeRaw(h+'\r\n'+body), prefill?.threadId);
+      onToast('Sent!','success');
       onBack();
-    } catch {
-      onToast('Failed to send.', 'error');
-    }
-    setSending(false);
+    } catch { onToast('Send failed.','error'); }
+    setBusy(false);
   };
 
   return (
-    <div className="compose-panel">
-      <div className="compose-header">
-        <button className="icon-btn" onClick={onBack}><ArrowLeft size={18} /></button>
-        <h2 className="compose-title">New Message</h2>
+    <div className="cmp">
+      <div className="cmp-bar">
+        <button className="ib" onClick={onBack}><ArrowLeft size={17}/></button>
+        <span className="cmp-title">New Message</span>
+        <div style={{marginLeft:'auto',display:'flex',gap:8}}>
+          <button className="btn-ghost" onClick={onBack}>Discard</button>
+          <button className="btn-send" onClick={send} disabled={busy}>{busy?'Sending…':'Send'} <Send size={12}/></button>
+        </div>
       </div>
-      <div className="compose-field">
-        <label>To</label>
-        <input type="email" value={to} onChange={e => setTo(e.target.value)} placeholder="recipient@example.com" />
-      </div>
-      <div className="compose-field">
-        <label>Subject</label>
-        <input type="text" value={subject} onChange={e => setSubject(e.target.value)} placeholder="Subject" />
-      </div>
-      <div className="compose-field compose-body-field">
-        <label>Message</label>
-        <textarea value={body} onChange={e => setBody(e.target.value)} rows={14} placeholder="Write your message..." />
-      </div>
-      <div className="compose-footer">
-        <button className="btn-primary" onClick={handleSend} disabled={sending}>
-          {sending ? 'Sending...' : 'Send'} <Send size={14} />
-        </button>
-        <button className="btn-ghost" onClick={onBack}>Discard</button>
+      <div className="cmp-fields">
+        <div className="cf"><label>To</label><input type="email" value={to} onChange={e=>setTo(e.target.value)} placeholder="recipient@example.com" autoFocus /></div>
+        {showCc
+          ? <div className="cf"><label>Cc</label><input type="email" value={cc} onChange={e=>setCc(e.target.value)} placeholder="cc@example.com" /></div>
+          : <button className="cc-tog" onClick={()=>setShowCc(true)}>+ Cc</button>
+        }
+        <div className="cf"><label>Subject</label><input type="text" value={subject} onChange={e=>setSubject(e.target.value)} placeholder="Subject" /></div>
+        <div className="cf cf-body"><textarea value={body} onChange={e=>setBody(e.target.value)} placeholder="Write your message…" rows={16} /></div>
       </div>
     </div>
   );
 }
 
-// ─── Main App ──────────────────────────────────────────────────────────────────
+// ─── App ─────────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [token, setToken] = useState(null);
-  const [isGoogleLoaded, setIsGoogleLoaded] = useState(false);
-  const [view, setView] = useState('login'); // login | inbox | detail | compose
-  const [folder, setFolder] = useState('inbox');
-  const [emails, setEmails] = useState([]);
-  const [selectedEmail, setSelectedEmail] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchInput, setSearchInput] = useState('');
-  const [pageTokens, setPageTokens] = useState([null]); // stack, pageTokens[0]=first page
-  const [currentPage, setCurrentPage] = useState(0);
-  const [hasNextPage, setHasNextPage] = useState(false);
-  const [unreadCount, setUnreadCount] = useState(0);
-  const [toast, setToast] = useState(null);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [token,     setToken]     = useState(null);
+  const [api,       setApi]       = useState(null);
+  const [gLoaded,   setGLoaded]   = useState(false);
+  const [view,      setView]      = useState('login');
+  const [folder,    setFolder]    = useState('inbox');
+  const [emails,    setEmails]    = useState([]);
+  const [selEmail,  setSelEmail]  = useState(null);
+  const [loading,   setLoading]   = useState(false);
+  const [search,    setSearch]    = useState('');
+  const [activeQ,   setActiveQ]   = useState('');
+  const [pageTokens,setPageTokens]= useState([null]);
+  const [page,      setPage]      = useState(0);
+  const [hasNext,   setHasNext]   = useState(false);
+  const [unread,    setUnread]    = useState(0);
+  const [toasts,    setToasts]    = useState([]);
+  const [sbOpen,    setSbOpen]    = useState(false);
+  const [userEmail, setUserEmail] = useState('');
+  const [prefill,   setPrefill]   = useState(null);
+  const [mobile,    setMobile]    = useState(window.innerWidth < 768);
 
   useEffect(() => {
-    if (window.google) { setIsGoogleLoaded(true); return; }
-    const script = document.createElement('script');
-    script.src = 'https://accounts.google.com/gsi/client';
-    script.onload = () => setIsGoogleLoaded(true);
-    script.async = true; script.defer = true;
-    document.body.appendChild(script);
+    const h = () => setMobile(window.innerWidth < 768);
+    window.addEventListener('resize', h);
+    return () => window.removeEventListener('resize', h);
   }, []);
 
-  const showToast = (message, type = 'success') => setToast({ message, type });
+  useEffect(() => {
+    if (window.google) { setGLoaded(true); return; }
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.onload = () => setGLoaded(true);
+    s.async = true; s.defer = true;
+    document.head.appendChild(s);
+  }, []);
 
-  const folderQuery = useCallback(() => {
-    if (searchQuery) return searchQuery;
-    switch (folder) {
-      case 'sent': return 'in:sent';
-      case 'drafts': return 'in:drafts';
-      case 'starred': return 'is:starred';
-      default: return 'in:inbox';
+  // Restore session
+  useEffect(() => {
+    const tok = getCookie(TOKEN_COOKIE);
+    if (tok) {
+      const a = new Gmail(tok);
+      setToken(tok); setApi(a);
+      const u = getCookie(USER_COOKIE);
+      if (u) setUserEmail(u);
+      setView('inbox');
     }
-  }, [folder, searchQuery]);
+  }, []);
 
-  const fetchEmails = useCallback(async (tok, pageToken = null, resetStack = true) => {
-    if (!tok) return;
+  const toast = useCallback((msg, type='success') => {
+    const id = Date.now();
+    setToasts(t => [...t, { id, message: msg, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4000);
+  }, []);
+
+  const getQ = useCallback(() => {
+    if (activeQ) return activeQ;
+    return FOLDERS.find(f => f.id === folder)?.q || 'in:inbox';
+  }, [folder, activeQ]);
+
+  const fetchPage = useCallback(async (a, pt, reset = true) => {
+    if (!a) return;
     setLoading(true);
     try {
-      const q = folderQuery();
-      let url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${PAGE_SIZE}&q=${encodeURIComponent(q)}`;
-      if (pageToken) url += `&pageToken=${pageToken}`;
-
-      const listRes = await fetch(url, { headers: { Authorization: `Bearer ${tok}` } });
-      const listData = await listRes.json();
-
-      setHasNextPage(!!listData.nextPageToken);
-
-      if (resetStack) {
-        setPageTokens([null]);
-        setCurrentPage(0);
-      }
-      if (listData.nextPageToken && resetStack) {
-        setPageTokens([null, listData.nextPageToken]);
-      } else if (listData.nextPageToken && !resetStack) {
+      const data = await a.list(getQ(), pt);
+      setHasNext(!!data.nextPageToken);
+      if (reset) {
+        setPageTokens(data.nextPageToken ? [null, data.nextPageToken] : [null]);
+        setPage(0);
+      } else if (data.nextPageToken) {
         setPageTokens(prev => {
           const next = [...prev];
-          if (!next[currentPage + 1]) next.push(listData.nextPageToken);
+          if (!next[page + 1]) next.push(data.nextPageToken);
           return next;
         });
       }
+      if (!data.messages) { setEmails([]); setLoading(false); return; }
 
-      if (!listData.messages) { setEmails([]); setLoading(false); return; }
-
-      const details = await Promise.all(
-        listData.messages.map(msg =>
-          fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Date`, {
-            headers: { Authorization: `Bearer ${tok}` }
-          }).then(r => r.json())
-        )
-      );
-
-      setEmails(details.map(e => ({
-        id: e.id,
-        threadId: e.threadId,
+      const details = await Promise.all(data.messages.map(m => a.getMeta(m.id)));
+      const parsed = details.map(e => ({
+        id: e.id, threadId: e.threadId,
         labelIds: e.labelIds || [],
-        snippet: e.snippet,
+        snippet: e.snippet || '',
         internalDate: e.internalDate,
-        subject: getHeader(e.payload?.headers, 'Subject') || '(No Subject)',
-        from: getHeader(e.payload?.headers, 'From') || 'Unknown',
-        to: getHeader(e.payload?.headers, 'To') || '',
+        subject: hdr(e.payload?.headers,'Subject') || '(No Subject)',
+        from: hdr(e.payload?.headers,'From') || 'Unknown',
+        to: hdr(e.payload?.headers,'To') || '',
         payload: e.payload,
-      })));
-
-      // Unread count for inbox
-      if (!searchQuery && folder === 'inbox') {
-        const uc = details.filter(e => e.labelIds?.includes('UNREAD')).length;
-        setUnreadCount(uc);
-      }
-    } catch (err) {
-      console.error(err);
-      showToast('Failed to fetch emails.', 'error');
-    }
+      }));
+      setEmails(parsed);
+      if (folder === 'inbox' && !activeQ)
+        setUnread(parsed.filter(e => e.labelIds.includes('UNREAD')).length);
+    } catch { toast('Failed to load.','error'); }
     setLoading(false);
-  }, [folderQuery, currentPage, folder, searchQuery]);
+  }, [getQ, page, folder, activeQ, toast]);
 
-  useEffect(() => {
-    if (token) { fetchEmails(token, null, true); }
-  }, [folder, searchQuery, token]);
+  useEffect(() => { if (api) fetchPage(api, null, true); }, [folder, activeQ, api]);
 
   const openEmail = async (email) => {
-    // Fetch full message for body
+    setSelEmail(email);
+    if (mobile) setView('detail');
     try {
-      const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${email.id}?format=full`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      const full = await res.json();
-      setSelectedEmail({
-        ...email,
-        labelIds: full.labelIds || email.labelIds,
-        payload: full.payload,
-      });
-      setView('detail');
-
-      // Mark as read
+      const full = await api.getFull(email.id);
+      const up = { ...email, labelIds: full.labelIds || email.labelIds, payload: full.payload, internalDate: full.internalDate || email.internalDate, to: hdr(full.payload?.headers,'To') || email.to };
+      setSelEmail(up);
       if (full.labelIds?.includes('UNREAD')) {
-        await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${email.id}/modify`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ removeLabelIds: ['UNREAD'] }),
-        });
-        setEmails(prev => prev.map(e => e.id === email.id
-          ? { ...e, labelIds: e.labelIds.filter(l => l !== 'UNREAD') }
-          : e
-        ));
-        setUnreadCount(c => Math.max(0, c - 1));
+        await api.modify(email.id, { removeLabelIds: ['UNREAD'] });
+        const upd = e => e.id===email.id ? {...e,labelIds:e.labelIds.filter(l=>l!=='UNREAD')} : e;
+        setEmails(prev => prev.map(upd));
+        setUnread(c => Math.max(0,c-1));
       }
-    } catch {
-      showToast('Could not load email.', 'error');
-    }
+    } catch { toast('Could not load email.','error'); }
+  };
+
+  const mutateLabelIds = (email, add, remove) => {
+    const up = e => e.id===email.id
+      ? {...e, labelIds: [...e.labelIds.filter(l=>!remove.includes(l)), ...add.filter(l=>!e.labelIds.includes(l))]}
+      : e;
+    setEmails(prev => prev.map(up));
+    if (selEmail?.id===email.id) setSelEmail(up(selEmail));
   };
 
   const handleStar = async (email) => {
-    const isStarred = email.labelIds?.includes('STARRED');
-    const body = isStarred
-      ? { removeLabelIds: ['STARRED'] }
-      : { addLabelIds: ['STARRED'] };
+    const on = email.labelIds?.includes('STARRED');
     try {
-      await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${email.id}/modify`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const update = e => e.id === email.id
-        ? { ...e, labelIds: isStarred ? e.labelIds.filter(l => l !== 'STARRED') : [...e.labelIds, 'STARRED'] }
-        : e;
-      setEmails(prev => prev.map(update));
-      if (selectedEmail?.id === email.id) setSelectedEmail(update(selectedEmail));
-      showToast(isStarred ? 'Unstarred' : 'Starred!', 'success');
-    } catch { showToast('Action failed.', 'error'); }
+      await api.modify(email.id, on ? {removeLabelIds:['STARRED']} : {addLabelIds:['STARRED']});
+      mutateLabelIds(email, on?[]:['STARRED'], on?['STARRED']:[]);
+    } catch { toast('Action failed.','error'); }
+  };
+
+  const handleToggleRead = async (email) => {
+    const unr = email.labelIds?.includes('UNREAD');
+    try {
+      await api.modify(email.id, unr ? {removeLabelIds:['UNREAD']} : {addLabelIds:['UNREAD']});
+      mutateLabelIds(email, unr?[]:['UNREAD'], unr?['UNREAD']:[]);
+      setUnread(c => unr ? Math.max(0,c-1) : c+1);
+    } catch { toast('Action failed.','error'); }
   };
 
   const handleDelete = async (email) => {
     try {
-      await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${email.id}/trash`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setEmails(prev => prev.filter(e => e.id !== email.id));
-      if (view === 'detail') setView('inbox');
-      showToast('Moved to trash.', 'success');
-    } catch { showToast('Could not delete.', 'error'); }
+      await api.trash(email.id);
+      setEmails(prev => prev.filter(e => e.id!==email.id));
+      if (selEmail?.id===email.id) { setSelEmail(null); if(mobile) setView('inbox'); }
+      toast('Moved to trash.','success');
+    } catch { toast('Delete failed.','error'); }
+  };
+
+  const handleArchive = async (email) => {
+    try {
+      await api.modify(email.id, {removeLabelIds:['INBOX']});
+      setEmails(prev => prev.filter(e => e.id!==email.id));
+      if (selEmail?.id===email.id) { setSelEmail(null); if(mobile) setView('inbox'); }
+      toast('Archived.','success');
+    } catch { toast('Archive failed.','error'); }
   };
 
   const handleReply = async (email, body) => {
-    const to = email.from;
-    const subject = email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`;
-    const emailContent = `To: ${to}\r\nSubject: ${subject}\r\nIn-Reply-To: ${email.id}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`;
-    const encoded = btoa(unescape(encodeURIComponent(emailContent)))
-      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ raw: encoded, threadId: email.threadId }),
-    });
-    if (!res.ok) throw new Error();
-    showToast('Reply sent!', 'success');
+    const subj = email.subject?.startsWith('Re:') ? email.subject : `Re: ${email.subject}`;
+    const raw = encodeRaw(`To: ${email.from}\r\nSubject: ${subj}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`);
+    await api.send(raw, email.threadId);
+    toast('Reply sent!','success');
   };
 
-  const handleNextPage = () => {
-    const nextToken = pageTokens[currentPage + 1];
-    if (!nextToken) return;
-    const next = currentPage + 1;
-    setCurrentPage(next);
-    fetchEmails(token, nextToken, false);
+  const handleForward = async (email, to, extra) => {
+    const b = getBody(email.payload);
+    const quoted = `\n\n--- Forwarded message ---\nFrom: ${email.from}\nSubject: ${email.subject}\n\n${b.text || '(HTML content)'}`;
+    const raw = encodeRaw(`To: ${to}\r\nSubject: Fwd: ${email.subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${extra}${quoted}`);
+    await api.send(raw);
+    toast('Forwarded!','success');
   };
-
-  const handlePrevPage = () => {
-    if (currentPage === 0) return;
-    const prev = currentPage - 1;
-    setCurrentPage(prev);
-    fetchEmails(token, pageTokens[prev], false);
-  };
-
-  const handleSearch = (e) => {
-    e.preventDefault();
-    setSearchQuery(searchInput.trim());
-  };
-
-  const clearSearch = () => { setSearchQuery(''); setSearchInput(''); };
 
   const handleLogin = () => {
-    if (!isGoogleLoaded) return;
-    const client = window.google.accounts.oauth2.initTokenClient({
-      client_id: CLIENT_ID,
-      scope: SCOPES,
-      callback: (response) => {
-        if (response.error) { showToast('Login failed.', 'error'); return; }
-        setToken(response.access_token);
-        setView('inbox');
+    if (!gLoaded) return;
+    window.google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID, scope: SCOPES,
+      callback: async (resp) => {
+        if (resp.error) { toast('Login failed.','error'); return; }
+        const a = new Gmail(resp.access_token);
+        setCookie(TOKEN_COOKIE, resp.access_token, 1);
+        try {
+          const p = await a.profile();
+          if (p.emailAddress) { setUserEmail(p.emailAddress); setCookie(USER_COOKIE, p.emailAddress, 24); }
+        } catch {}
+        setToken(resp.access_token); setApi(a); setView('inbox');
       },
-    });
-    client.requestAccessToken();
+    }).requestAccessToken();
   };
 
   const handleLogout = () => {
-    if (token) window.google.accounts.oauth2.revoke(token, () => {});
-    setToken(null); setView('login'); setEmails([]);
+    if (token) { try { window.google?.accounts?.oauth2?.revoke(token,()=>{}); } catch {} }
+    deleteCookie(TOKEN_COOKIE); deleteCookie(USER_COOKIE);
+    setToken(null); setApi(null); setView('login');
+    setEmails([]); setSelEmail(null); setUserEmail('');
   };
 
-  // ── Login Screen ────────────────────────────────────────────────────────────
+  const compose = (pf=null) => { setPrefill(pf); setView('compose'); };
+  const nextPage = () => { const pt=pageTokens[page+1]; if(!pt) return; setPage(p=>p+1); fetchPage(api,pt,false); };
+  const prevPage = () => { if(page===0) return; const p2=page-1; setPage(p2); fetchPage(api,pageTokens[p2],false); };
+  const doSearch = e => { e.preventDefault(); setActiveQ(search.trim()); };
 
-  if (view === 'login') {
-    return (
-      <>
-        <style>{CSS}</style>
-        <div className="login-screen">
-          <div className="login-card">
-            <div className="login-badge">
-              <Mail size={32} />
-            </div>
-            <h1 className="login-title">NeoMail</h1>
-            <p className="login-sub">Your inbox, reimagined.</p>
-            <button className="login-btn" onClick={handleLogin} disabled={!isGoogleLoaded}>
-              <svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
-                <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z" fill="#4285F4"/>
-                <path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332C2.438 15.983 5.482 18 9 18z" fill="#34A853"/>
-                <path d="M3.964 10.71c-.18-.54-.282-1.117-.282-1.71s.102-1.17.282-1.71V4.958H.957C.347 6.173 0 7.548 0 9s.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
-                <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.482 0 2.438 2.017.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
-              </svg>
-              Sign in with Google
-            </button>
+  // ── Login ────────────────────────────────────────────────────────────────────
+  if (view === 'login') return (
+    <>
+      <style>{CSS}</style>
+      <div className="login-bg">
+        <div className="login-grid"/>
+        <div className="login-glow"/>
+        <div className="login-card">
+          <div className="l-icon">
+            <img src="mail.png" alt="" className="l-img" onError={e=>e.target.style.display='none'} />
+            <Mail size={32} className="l-mail-ico"/>
           </div>
+          <h1 className="l-title">NeoMail</h1>
+          <p className="l-tag">Your Gmail. Faster. Better.</p>
+          <div className="l-feats">
+            <span><Zap size={11}/> Instant inbox</span>
+            <span><Star size={11}/> Smart starring</span>
+            <span><Archive size={11}/> One-tap archive</span>
+          </div>
+          <button className="l-btn" onClick={handleLogin} disabled={!gLoaded}>
+            <svg width="17" height="17" viewBox="0 0 18 18">
+              <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908C16.658 14.013 17.64 11.706 17.64 9.2z" fill="#4285F4"/>
+              <path d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332C2.438 15.983 5.482 18 9 18z" fill="#34A853"/>
+              <path d="M3.964 10.71c-.18-.54-.282-1.117-.282-1.71s.102-1.17.282-1.71V4.958H.957C.347 6.173 0 7.548 0 9s.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
+              <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.482 0 2.438 2.017.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
+            </svg>
+            {gLoaded ? 'Continue with Google' : 'Loading…'}
+          </button>
+          <p className="l-legal">Secure OAuth 2.0 · We never store your password</p>
         </div>
-        {toast && <Toast {...toast} onClose={() => setToast(null)} />}
-      </>
-    );
-  }
+      </div>
+      {toasts.map(t=><Toast key={t.id} {...t} onClose={()=>setToasts(x=>x.filter(i=>i.id!==t.id))}/>)}
+    </>
+  );
 
-  // ── App Shell ───────────────────────────────────────────────────────────────
+  // ── App ──────────────────────────────────────────────────────────────────────
+  const showList    = !mobile || view==='inbox';
+  const showDetail  = (!mobile || view==='detail') && view!=='compose';
+  const showCompose = view==='compose';
 
   return (
     <>
       <style>{CSS}</style>
-      <div className="app-shell">
+      <div className="app">
         <Sidebar
           folder={folder}
-          setFolder={(f) => { setFolder(f); setView('inbox'); setSelectedEmail(null); }}
-          unreadCount={unreadCount}
-          sidebarOpen={sidebarOpen}
-          setSidebarOpen={setSidebarOpen}
+          setFolder={f => { setFolder(f); setSelEmail(null); if(mobile) setView('inbox'); }}
+          unread={unread}
+          open={sbOpen}
+          onClose={() => setSbOpen(false)}
+          onCompose={compose}
+          onLogout={handleLogout}
+          userEmail={userEmail}
         />
 
-        <div className="main-col">
-          {/* Topbar */}
+        <div className="main">
           <header className="topbar">
-            <button className="icon-btn mobile-menu-btn" onClick={() => setSidebarOpen(true)}>
-              <Menu size={20} />
-            </button>
-            <form className="search-form" onSubmit={handleSearch}>
-              <Search size={15} className="search-icon" />
-              <input
-                className="search-input"
-                placeholder="Search mail..."
-                value={searchInput}
-                onChange={e => setSearchInput(e.target.value)}
-              />
-              {searchQuery && (
-                <button type="button" className="search-clear" onClick={clearSearch}><X size={13} /></button>
-              )}
+            <button className="ib hamburger" onClick={() => setSbOpen(true)}><Menu size={19}/></button>
+            <form className="s-wrap" onSubmit={doSearch}>
+              <Search size={13} className="s-ico"/>
+              <input className="s-inp" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search mail…"/>
+              {activeQ && <button type="button" className="s-clr" onClick={()=>{setActiveQ('');setSearch('');}}><X size={12}/></button>}
             </form>
-            <div className="topbar-actions">
-              <button
-                className="btn-compose"
-                onClick={() => setView('compose')}
-              >
-                <PenSquare size={15} /> Compose
-              </button>
-              <button className="icon-btn" onClick={handleLogout} title="Sign out">
-                <LogOut size={17} />
-              </button>
-            </div>
+            <button className="ib" onClick={()=>compose()} title="Compose"><PenSquare size={16}/></button>
+            <button className="ib" onClick={handleLogout} title="Sign out"><LogOut size={15}/></button>
           </header>
 
-          {/* Content */}
-          <div className="content-area">
-            {view === 'detail' && selectedEmail && (
-              <EmailDetail
-                email={selectedEmail}
-                onBack={() => setView('inbox')}
-                onReply={handleReply}
-                onDelete={handleDelete}
-                onStar={handleStar}
-              />
-            )}
-
-            {view === 'compose' && (
-              <ComposePanel token={token} onBack={() => setView('inbox')} onToast={showToast} />
-            )}
-
-            {(view === 'inbox' || view === 'login') && view !== 'detail' && view !== 'compose' && (
-              <div className="list-panel">
-                <div className="list-toolbar">
-                  <div className="list-folder-title">
-                    {searchQuery
-                      ? <><Search size={16} /> Results for "{searchQuery}"</>
-                      : folder.charAt(0).toUpperCase() + folder.slice(1)
-                    }
-                  </div>
-                  <div className="list-toolbar-right">
-                    <span className="page-indicator">
-                      Page {currentPage + 1}
-                    </span>
-                    <button className="icon-btn" onClick={() => fetchEmails(token, null, true)} disabled={loading} title="Refresh">
-                      <RefreshCw size={15} className={loading ? 'spin' : ''} />
-                    </button>
+          <div className="panels">
+            {showList && !showCompose && (
+              <div className={`list-pane ${!mobile && selEmail ? 'list-narrow' : ''}`}>
+                <div className="l-toolbar">
+                  <span className="l-fname">{activeQ ? `"${activeQ}"` : FOLDERS.find(f=>f.id===folder)?.label}</span>
+                  <div style={{display:'flex',alignItems:'center',gap:6}}>
+                    {page>0 && <span className="pg-lbl">Pg {page+1}</span>}
+                    <button className="ib" onClick={()=>fetchPage(api,null,true)} disabled={loading}><RefreshCw size={13} className={loading?'spin':''}/></button>
                   </div>
                 </div>
-
-                {loading ? (
-                  <div className="loading-state">
-                    <div className="loading-rows">
-                      {Array.from({ length: 8 }).map((_, i) => (
-                        <div key={i} className="skeleton-row" style={{ animationDelay: `${i * 60}ms` }} />
-                      ))}
-                    </div>
-                  </div>
-                ) : emails.length === 0 ? (
-                  <div className="empty-state">
-                    <Mail size={40} strokeWidth={1} />
-                    <span>No emails found</span>
-                  </div>
-                ) : (
-                  <div className="email-list">
-                    {emails.map(email => (
-                      <EmailRow
-                        key={email.id}
-                        email={email}
-                        onOpen={openEmail}
-                        onStar={handleStar}
-                        onDelete={handleDelete}
-                      />
-                    ))}
-                  </div>
-                )}
-
-                <div className="pagination">
-                  <button
-                    className="page-btn"
-                    onClick={handlePrevPage}
-                    disabled={currentPage === 0 || loading}
-                  >
-                    <ChevronLeft size={16} /> Prev
-                  </button>
-                  <button
-                    className="page-btn"
-                    onClick={handleNextPage}
-                    disabled={!hasNextPage || loading}
-                  >
-                    Next <ChevronRight size={16} />
-                  </button>
+                <div className="email-list">
+                  {loading
+                    ? Array.from({length:10}).map((_,i)=><div key={i} className="skel" style={{animationDelay:`${i*45}ms`}}/>)
+                    : emails.length===0
+                      ? <div className="empty"><Mail size={32} strokeWidth={1}/><span>No emails</span></div>
+                      : emails.map(e=><Row key={e.id} email={e} sel={selEmail?.id===e.id} onOpen={openEmail} onStar={handleStar} onDelete={handleDelete} onArchive={handleArchive} onToggleRead={handleToggleRead}/>)
+                  }
+                </div>
+                <div className="pag">
+                  <button className="pg-btn" onClick={prevPage} disabled={page===0||loading}><ChevronLeft size={14}/>Prev</button>
+                  <button className="pg-btn" onClick={nextPage} disabled={!hasNext||loading}>Next<ChevronRight size={14}/></button>
                 </div>
               </div>
             )}
+
+            {showDetail && selEmail && (
+              <div className="det-wrap">
+                <Detail email={selEmail} onBack={()=>{setSelEmail(null);if(mobile)setView('inbox');}} onReply={handleReply} onForward={handleForward} onDelete={handleDelete} onStar={handleStar} onToggleRead={handleToggleRead} mobile={mobile}/>
+              </div>
+            )}
+
+            {!showCompose && !selEmail && !mobile && (
+              <div className="empty-det"><Mail size={44} strokeWidth={1}/><p>Select an email to read</p></div>
+            )}
+
+            {showCompose && (
+              <div className="det-wrap">
+                <Compose api={api} onBack={()=>setView(selEmail&&!mobile?'detail':'inbox')} onToast={toast} prefill={prefill}/>
+              </div>
+            )}
           </div>
+
+          {mobile && (
+            <nav className="mob-nav">
+              {FOLDERS.slice(0,4).map(({id,label,icon:Icon})=>(
+                <button key={id} className={`mob-btn ${folder===id&&view==='inbox'?'mob-active':''}`}
+                  onClick={()=>{setFolder(id);setView('inbox');setSelEmail(null);}}>
+                  <Icon size={18}/>
+                  {id==='inbox'&&unread>0&&<span className="mob-badge">{unread>9?'9+':unread}</span>}
+                  <span>{label}</span>
+                </button>
+              ))}
+              <button className="mob-btn" onClick={()=>compose()}><PenSquare size={18}/><span>Compose</span></button>
+            </nav>
+          )}
         </div>
       </div>
-
-      {toast && <Toast {...toast} onClose={() => setToast(null)} />}
+      {toasts.map(t=><Toast key={t.id} {...t} onClose={()=>setToasts(x=>x.filter(i=>i.id!==t.id))}/>)}
     </>
   );
 }
 
-// ─── CSS ───────────────────────────────────────────────────────────────────────
+// ─── CSS ────────────────────────────────────────────────────────────────────────
 
 const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body,#root{height:100%;overflow:hidden}
+body{font-family:'DM Sans',sans-serif;color:#111;background:#f0efe8;-webkit-font-smoothing:antialiased}
+:root{
+  --bg:#f0efe8;--surface:#fff;--border:#111;--soft:#e2e0d8;
+  --t2:#555;--t3:#999;--acc:#0052ff;--acc-dim:#e8eeff;
+  --star:#f0a500;--danger:#e53e3e;
+  --mono:'Space Mono',monospace;
+  --sb:220px;--tb:52px;--mob-nav:60px;
+  --sh:3px 3px 0 #111;--sh-lg:5px 5px 0 #111;--r:3px;
+}
 
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+/* LOGIN */
+.login-bg{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0a0a;position:relative;overflow:hidden}
+.login-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.045) 1px,transparent 1px);background-size:48px 48px}
+.login-glow{position:absolute;top:30%;left:50%;transform:translate(-50%,-50%);width:600px;height:600px;background:radial-gradient(circle,rgba(0,82,255,.22) 0%,transparent 70%);pointer-events:none}
+.login-card{position:relative;z-index:1;background:#111;border:2px solid #2a2a2a;box-shadow:0 0 0 1px #1e1e1e,var(--sh-lg);padding:48px 40px;width:380px;display:flex;flex-direction:column;align-items:center;gap:13px;text-align:center}
+.l-icon{width:72px;height:72px;background:#0052ff;border:2px solid #333;display:flex;align-items:center;justify-content:center;position:relative;margin-bottom:4px}
+.l-img{width:100%;height:100%;object-fit:cover;position:absolute;inset:0}
+.l-mail-ico{color:#fff;position:relative}
+.l-title{font-family:var(--mono);font-size:30px;font-weight:700;color:#fff;letter-spacing:-.5px}
+.l-tag{color:#777;font-size:14px}
+.l-feats{display:flex;gap:14px;margin:4px 0}
+.l-feats span{display:flex;align-items:center;gap:4px;font-size:11.5px;color:#666;font-weight:500}
+.l-feats svg{color:#0052ff}
+.l-btn{margin-top:8px;width:100%;display:flex;align-items:center;justify-content:center;gap:10px;padding:13px 20px;background:#fff;border:2px solid #111;box-shadow:var(--sh);font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer;transition:transform 80ms,box-shadow 80ms;color:#111}
+.l-btn:hover{transform:translate(2px,2px);box-shadow:1px 1px 0 #111}
+.l-btn:disabled{opacity:.5;pointer-events:none}
+.l-legal{font-size:11px;color:#444;margin-top:4px}
 
-  :root {
-    --bg: #f5f5f0;
-    --surface: #ffffff;
-    --border: #111111;
-    --border-light: #e0e0d8;
-    --text: #111111;
-    --text-2: #555550;
-    --text-3: #999990;
-    --accent: #0052ff;
-    --accent-hover: #0040cc;
-    --accent-soft: #e8efff;
-    --warn: #ff3b30;
-    --star: #f5a623;
-    --green: #00b37e;
-    --mono: 'Space Mono', monospace;
-    --sans: 'DM Sans', sans-serif;
-    --sidebar-w: 210px;
-    --topbar-h: 56px;
-    --radius: 4px;
-    --shadow: 3px 3px 0px #111;
-    --shadow-lg: 5px 5px 0px #111;
-  }
+/* APP SHELL */
+.app{display:flex;height:100vh;overflow:hidden}
+.main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}
 
-  body { background: var(--bg); color: var(--text); font-family: var(--sans); }
+/* SIDEBAR */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:199}
+.sidebar{width:var(--sb);min-width:var(--sb);height:100vh;background:var(--surface);border-right:2px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;z-index:200;transition:transform 220ms ease}
+.sb-head{display:flex;align-items:center;justify-content:space-between;padding:14px 12px;border-bottom:2px solid var(--border)}
+.sb-logo{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:1px}
+.sb-img{width:24px;height:24px;object-fit:cover;border:1.5px solid var(--border)}
+.sb-mail-ico{color:#0052ff}
+.close-btn{display:none}
+.compose-sb-btn{margin:10px 10px 6px;display:flex;align-items:center;justify-content:center;gap:8px;padding:10px;background:var(--acc);color:#fff;border:2px solid var(--border);box-shadow:var(--sh);font-family:'DM Sans',sans-serif;font-size:13.5px;font-weight:600;cursor:pointer;transition:transform 80ms,box-shadow 80ms}
+.compose-sb-btn:hover{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--border)}
+.sb-nav{flex:1;padding:6px 8px;display:flex;flex-direction:column;gap:2px;overflow-y:auto}
+.ni{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:var(--r);cursor:pointer;border:1.5px solid transparent;background:none;font-family:'DM Sans',sans-serif;font-size:13.5px;font-weight:500;color:var(--t2);text-align:left;transition:all 80ms;width:100%}
+.ni:hover{background:var(--bg);color:#111;border-color:var(--soft)}
+.ni-active{background:var(--acc-dim)!important;color:var(--acc)!important;border-color:var(--acc)!important;font-weight:600}
+.ni-badge{margin-left:auto;background:var(--acc);color:#fff;border-radius:10px;font-size:10px;font-family:var(--mono);padding:1px 6px;min-width:18px;text-align:center}
+.sb-foot{padding:8px;border-top:2px solid var(--soft)}
+.sb-email{font-size:10.5px;color:var(--t3);padding:5px 10px;font-family:var(--mono);word-break:break-all}
 
-  /* ── Login ── */
-  .login-screen {
-    min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    background: var(--bg);
-    background-image: repeating-linear-gradient(0deg, transparent, transparent 39px, var(--border-light) 40px),
-                      repeating-linear-gradient(90deg, transparent, transparent 39px, var(--border-light) 40px);
-  }
-  .login-card {
-    background: var(--surface); border: 2px solid var(--border);
-    box-shadow: var(--shadow-lg); padding: 48px 40px; text-align: center;
-    width: 360px; display: flex; flex-direction: column; align-items: center; gap: 12px;
-  }
-  .login-badge {
-    width: 64px; height: 64px; background: var(--accent); border: 2px solid var(--border);
-    display: flex; align-items: center; justify-content: center; color: white;
-    box-shadow: var(--shadow); margin-bottom: 8px;
-  }
-  .login-title {
-    font-family: var(--mono); font-size: 28px; font-weight: 700; letter-spacing: -0.5px;
-  }
-  .login-sub { color: var(--text-2); font-size: 14px; margin-bottom: 8px; }
-  .login-btn {
-    margin-top: 16px; width: 100%; display: flex; align-items: center; justify-content: center;
-    gap: 10px; padding: 12px 20px; background: var(--surface); border: 2px solid var(--border);
-    box-shadow: var(--shadow); font-family: var(--sans); font-size: 15px; font-weight: 600;
-    cursor: pointer; transition: transform 80ms, box-shadow 80ms;
-  }
-  .login-btn:hover { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--border); }
-  .login-btn:disabled { opacity: 0.5; pointer-events: none; }
+/* TOPBAR */
+.topbar{height:var(--tb);border-bottom:2px solid var(--border);display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--surface);flex-shrink:0}
+.hamburger{flex-shrink:0}
+.s-wrap{flex:1;max-width:540px;position:relative;display:flex;align-items:center}
+.s-ico{position:absolute;left:9px;color:var(--t3);pointer-events:none}
+.s-inp{width:100%;padding:7px 28px 7px 30px;border:1.5px solid var(--soft);border-radius:var(--r);background:var(--bg);font-family:'DM Sans',sans-serif;font-size:13.5px;color:#111;outline:none;transition:border-color 100ms}
+.s-inp:focus{border-color:var(--border);background:#fff}
+.s-clr{position:absolute;right:8px;background:none;border:none;cursor:pointer;color:var(--t3);display:flex;align-items:center}
 
-  /* ── App Shell ── */
-  .app-shell {
-    display: flex; height: 100vh; overflow: hidden;
-  }
+/* PANELS */
+.panels{flex:1;display:flex;overflow:hidden;min-height:0}
 
-  /* ── Sidebar ── */
-  .sidebar {
-    width: var(--sidebar-w); min-width: var(--sidebar-w); height: 100vh;
-    background: var(--surface); border-right: 2px solid var(--border);
-    display: flex; flex-direction: column; flex-shrink: 0; z-index: 100;
-  }
-  .sidebar-logo {
-    display: flex; align-items: center; gap: 10px;
-    padding: 18px 16px; border-bottom: 2px solid var(--border);
-  }
-  .logo-icon {
-    width: 32px; height: 32px; background: var(--accent); display: flex; align-items: center;
-    justify-content: center; color: white; border: 1.5px solid var(--border); flex-shrink: 0;
-  }
-  .logo-text { font-family: var(--mono); font-size: 14px; font-weight: 700; letter-spacing: 1px; }
-  .sidebar-nav { padding: 8px; display: flex; flex-direction: column; gap: 2px; }
-  .nav-item {
-    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
-    border-radius: var(--radius); cursor: pointer; border: 1.5px solid transparent;
-    background: none; font-family: var(--sans); font-size: 14px; font-weight: 500;
-    color: var(--text-2); text-align: left; transition: all 80ms;
-  }
-  .nav-item:hover { background: var(--bg); color: var(--text); border-color: var(--border-light); }
-  .nav-item-active {
-    background: var(--accent-soft); color: var(--accent); border-color: var(--accent) !important;
-    font-weight: 600;
-  }
-  .nav-badge {
-    margin-left: auto; background: var(--accent); color: white; border-radius: 10px;
-    font-size: 11px; font-family: var(--mono); padding: 1px 6px; min-width: 20px; text-align: center;
-  }
-  .sidebar-overlay {
-    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 99;
-  }
+/* LIST */
+.list-pane{width:380px;min-width:310px;border-right:2px solid var(--border);display:flex;flex-direction:column;background:var(--surface);flex-shrink:0;transition:width 200ms}
+.list-narrow{width:300px;min-width:250px}
+.l-toolbar{display:flex;align-items:center;justify-content:space-between;padding:9px 13px;border-bottom:2px solid var(--border);background:var(--surface);flex-shrink:0}
+.l-fname{font-family:var(--mono);font-size:11.5px;font-weight:700;letter-spacing:.5px}
+.pg-lbl{font-family:var(--mono);font-size:10px;color:var(--t3)}
+.email-list{flex:1;overflow-y:auto}
 
-  /* ── Main Column ── */
-  .main-col {
-    flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden;
-  }
+/* ROW */
+.row{display:flex;align-items:flex-start;gap:9px;padding:11px 13px;border-bottom:1px solid var(--soft);cursor:pointer;background:#fff;transition:background 80ms;position:relative}
+.row:hover{background:#fafaf7}
+.row:hover .row-acts{opacity:1}
+.row-u{background:#fff}
+.row-u .row-from,.row-u .row-sub{font-weight:700;color:#111}
+.row-sel{background:var(--acc-dim)!important;border-left:3px solid var(--acc)}
+.star-b{flex-shrink:0;width:18px;height:18px;background:none;border:none;cursor:pointer;color:var(--t3);display:flex;align-items:center;justify-content:center;margin-top:2px;transition:color 80ms}
+.star-b:hover,.star-on{color:var(--star)!important}
+.row-av{flex-shrink:0;width:28px;height:28px;background:var(--acc);color:#fff;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;font-weight:700;border:1.5px solid var(--border);margin-top:1px}
+.row-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.row-t1{display:flex;align-items:baseline;justify-content:space-between;gap:6px}
+.row-from{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.row-date{font-family:var(--mono);font-size:9.5px;color:var(--t3);flex-shrink:0}
+.row-sub{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#111}
+.row-snip{font-size:11.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row-acts{position:absolute;right:8px;top:50%;transform:translateY(-50%);display:flex;gap:2px;opacity:0;transition:opacity 100ms;background:#fff;border:1px solid var(--soft);padding:3px}
+.row-sel .row-acts{background:var(--acc-dim)}
+.ra-btn{width:22px;height:22px;background:none;border:none;cursor:pointer;color:var(--t3);display:flex;align-items:center;justify-content:center;border-radius:2px;transition:all 80ms}
+.ra-btn:hover{background:var(--bg);color:#111}
+.ra-del:hover{color:var(--danger)!important}
 
-  /* ── Topbar ── */
-  .topbar {
-    height: var(--topbar-h); border-bottom: 2px solid var(--border);
-    display: flex; align-items: center; gap: 12px; padding: 0 16px;
-    background: var(--surface); flex-shrink: 0;
-  }
-  .mobile-menu-btn { display: none; }
-  .search-form {
-    flex: 1; max-width: 520px; position: relative; display: flex; align-items: center;
-  }
-  .search-icon { position: absolute; left: 10px; color: var(--text-3); pointer-events: none; }
-  .search-input {
-    width: 100%; padding: 8px 12px 8px 34px; border: 1.5px solid var(--border-light);
-    border-radius: var(--radius); background: var(--bg); font-family: var(--sans);
-    font-size: 14px; color: var(--text); outline: none; transition: border-color 100ms;
-  }
-  .search-input:focus { border-color: var(--border); background: var(--surface); }
-  .search-clear {
-    position: absolute; right: 8px; background: none; border: none; cursor: pointer;
-    color: var(--text-3); display: flex; align-items: center;
-  }
-  .topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-  .btn-compose {
-    display: flex; align-items: center; gap: 6px; padding: 8px 16px;
-    background: var(--accent); color: white; border: 2px solid var(--border);
-    box-shadow: var(--shadow); font-family: var(--sans); font-size: 14px; font-weight: 600;
-    cursor: pointer; transition: transform 80ms, box-shadow 80ms;
-  }
-  .btn-compose:hover { transform: translate(2px, 2px); box-shadow: 1px 1px 0 var(--border); }
+/* SKELETON */
+.skel{height:68px;background:linear-gradient(90deg,#eee 25%,#f5f5f2 50%,#eee 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;border-bottom:1px solid var(--soft)}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 
-  /* ── Icon Btn ── */
-  .icon-btn {
-    width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
-    background: none; border: 1.5px solid transparent; border-radius: var(--radius);
-    cursor: pointer; color: var(--text-2); transition: all 80ms;
-  }
-  .icon-btn:hover { background: var(--bg); border-color: var(--border-light); color: var(--text); }
-  .star-active { color: var(--star) !important; }
-  .danger-btn:hover { color: var(--warn) !important; background: #fff0ef !important; }
+/* EMPTY */
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:80px 20px;color:var(--t3);font-size:14px}
+.empty-det{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--t3);font-size:14px;background:var(--bg)}
 
-  /* ── Content Area ── */
-  .content-area {
-    flex: 1; overflow-y: auto; background: var(--bg);
-  }
+/* PAGINATION */
+.pag{display:flex;gap:8px;padding:11px;border-top:2px solid var(--border);background:var(--surface);justify-content:center;flex-shrink:0}
+.pg-btn{display:flex;align-items:center;gap:4px;padding:6px 13px;background:#fff;border:2px solid var(--border);box-shadow:var(--sh);font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:transform 80ms,box-shadow 80ms}
+.pg-btn:hover:not(:disabled){transform:translate(2px,2px);box-shadow:1px 1px 0 var(--border)}
+.pg-btn:disabled{opacity:.35;pointer-events:none}
 
-  /* ── List Panel ── */
-  .list-panel { display: flex; flex-direction: column; height: 100%; }
-  .list-toolbar {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 16px; background: var(--surface); border-bottom: 2px solid var(--border);
-    position: sticky; top: 0; z-index: 5;
-  }
-  .list-folder-title {
-    font-family: var(--mono); font-size: 14px; font-weight: 700;
-    display: flex; align-items: center; gap: 8px;
-  }
-  .list-toolbar-right { display: flex; align-items: center; gap: 8px; }
-  .page-indicator { font-family: var(--mono); font-size: 12px; color: var(--text-3); }
+/* DETAIL */
+.det-wrap{flex:1;overflow-y:auto;background:#fff;min-width:0;display:flex;flex-direction:column}
+.det{display:flex;flex-direction:column;max-width:840px;width:100%;margin:0 auto;padding-bottom:60px}
+.det-bar{display:flex;align-items:center;justify-content:flex-end;padding:9px 14px;border-bottom:2px solid var(--border);position:sticky;top:0;background:#fff;z-index:5;gap:3px}
+.det-acts{display:flex;gap:2px}
+.det-body{padding:22px 22px 0}
+.det-subj{font-size:21px;font-weight:700;line-height:1.3;margin-bottom:16px}
+.det-meta{display:flex;align-items:center;gap:11px;padding-bottom:16px;border-bottom:1px solid var(--soft)}
+.det-av{width:38px;height:38px;background:var(--acc);color:#fff;border:2px solid var(--border);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:14px;font-weight:700;flex-shrink:0}
+.det-meta-txt{flex:1;min-width:0}
+.det-from{font-size:14px;font-weight:600}
+.det-addr{font-size:11px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.det-dt{font-family:var(--mono);font-size:10.5px;color:var(--t3);flex-shrink:0}
+.det-content{padding:22px 0}
+.ifr{width:100%;border:none;display:block;min-height:80px}
+.det-txt{white-space:pre-wrap;font-family:var(--mono);font-size:12.5px;line-height:1.75;color:#111}
 
-  /* ── Email List ── */
-  .email-list { display: flex; flex-direction: column; }
-  .email-row {
-    display: flex; align-items: center; gap: 12px; padding: 12px 16px;
-    background: var(--surface); border-bottom: 1px solid var(--border-light);
-    cursor: pointer; transition: background 80ms;
-  }
-  .email-row:hover { background: var(--bg); }
-  .email-row-unread { background: var(--surface); }
-  .email-row-unread .row-sender,
-  .email-row-unread .row-subject { font-weight: 700 !important; }
-  .star-btn {
-    flex-shrink: 0; width: 28px; height: 28px; background: none; border: none;
-    cursor: pointer; color: var(--text-3); display: flex; align-items: center; justify-content: center;
-    transition: color 80ms;
-  }
-  .star-btn:hover { color: var(--star); }
-  .row-sender {
-    width: 160px; min-width: 160px; font-size: 14px; font-weight: 500; color: var(--text);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0;
-  }
-  .row-subject-group {
-    flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px;
-  }
-  .row-subject {
-    font-size: 14px; color: var(--text); white-space: nowrap; overflow: hidden;
-    text-overflow: ellipsis; flex-shrink: 0; max-width: 260px;
-  }
-  .row-snippet {
-    font-size: 13px; color: var(--text-3); white-space: nowrap; overflow: hidden;
-    text-overflow: ellipsis; flex: 1;
-  }
-  .row-meta {
-    display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: auto;
-  }
-  .row-date {
-    font-family: var(--mono); font-size: 12px; color: var(--text-3); white-space: nowrap;
-  }
-  .delete-btn {
-    width: 24px; height: 24px; background: none; border: none; cursor: pointer;
-    color: var(--text-3); opacity: 0; display: flex; align-items: center; justify-content: center;
-    transition: opacity 80ms, color 80ms;
-  }
-  .email-row:hover .delete-btn { opacity: 1; }
-  .delete-btn:hover { color: var(--warn); }
+/* REPLY/FWD */
+.rc{margin:0 0 24px;border:2px solid var(--border);box-shadow:var(--sh);background:#fff}
+.rc-lbl{display:flex;align-items:center;gap:6px;padding:8px 11px;border-bottom:2px solid var(--border);font-size:11.5px;font-weight:700;background:var(--bg);font-family:var(--mono)}
+.rc-inp{width:100%;padding:9px 11px;border:none;border-bottom:1px solid var(--soft);font-family:'DM Sans',sans-serif;font-size:13px;outline:none;background:#fff}
+.rc-ta{width:100%;padding:11px;border:none;outline:none;resize:vertical;font-family:'DM Sans',sans-serif;font-size:14px;line-height:1.65;background:#fff;min-height:90px}
+.rc-foot{display:flex;gap:8px;align-items:center;padding:9px 11px;border-top:1px solid var(--soft);background:var(--bg)}
+.ib-del:hover{color:var(--danger)!important}
 
-  /* ── Skeleton ── */
-  .loading-state { padding: 0; }
-  .skeleton-row {
-    height: 57px; background: linear-gradient(90deg, #eee 25%, #f5f5f0 50%, #eee 75%);
-    background-size: 200% 100%; animation: shimmer 1.2s infinite; border-bottom: 1px solid var(--border-light);
-  }
-  @keyframes shimmer { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }
+/* COMPOSE */
+.cmp{display:flex;flex-direction:column;max-width:840px;width:100%;margin:0 auto;height:100%}
+.cmp-bar{display:flex;align-items:center;gap:11px;padding:11px 14px;border-bottom:2px solid var(--border);flex-shrink:0;background:#fff;position:sticky;top:0;z-index:5}
+.cmp-title{font-family:var(--mono);font-size:13px;font-weight:700}
+.cmp-fields{flex:1;display:flex;flex-direction:column;overflow-y:auto}
+.cf{display:flex;flex-direction:column;gap:5px;padding:11px 14px;border-bottom:1px solid var(--soft)}
+.cf label{font-size:10.5px;font-weight:700;font-family:var(--mono);color:var(--t2);letter-spacing:.5px;text-transform:uppercase}
+.cf input,.cf textarea{border:1.5px solid var(--soft);background:var(--bg);border-radius:var(--r);padding:8px 10px;font-family:'DM Sans',sans-serif;font-size:14px;color:#111;outline:none;transition:border-color 100ms}
+.cf input:focus,.cf textarea:focus{border-color:var(--border);background:#fff}
+.cf textarea{resize:none;flex:1;min-height:220px}
+.cf-body{flex:1}
+.cc-tog{padding:6px 14px;text-align:left;font-size:12px;color:var(--acc);font-weight:600;background:none;border:none;cursor:pointer;border-bottom:1px solid var(--soft)}
 
-  /* ── Empty ── */
-  .empty-state {
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 12px; padding: 80px 20px; color: var(--text-3); font-size: 15px;
-  }
+/* BUTTONS */
+.ib{width:34px;height:34px;display:flex;align-items:center;justify-content:center;background:none;border:1.5px solid transparent;border-radius:var(--r);cursor:pointer;color:var(--t2);transition:all 80ms;flex-shrink:0}
+.ib:hover{background:var(--bg);border-color:var(--soft);color:#111}
+.btn-send{display:flex;align-items:center;gap:5px;padding:8px 15px;background:var(--acc);color:#fff;border:2px solid var(--border);box-shadow:var(--sh);font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:transform 80ms,box-shadow 80ms;flex-shrink:0}
+.btn-send:hover:not(:disabled){transform:translate(2px,2px);box-shadow:1px 1px 0 var(--border)}
+.btn-send:disabled{opacity:.4;pointer-events:none}
+.btn-ghost{display:flex;align-items:center;gap:5px;padding:7px 12px;background:none;border:1.5px solid var(--soft);border-radius:var(--r);font-family:'DM Sans',sans-serif;font-size:13px;font-weight:500;cursor:pointer;color:var(--t2)}
+.btn-ghost:hover{border-color:var(--border);color:#111}
 
-  /* ── Pagination ── */
-  .pagination {
-    display: flex; gap: 8px; padding: 16px; border-top: 2px solid var(--border);
-    background: var(--surface); justify-content: center; margin-top: auto;
-    position: sticky; bottom: 0;
-  }
-  .page-btn {
-    display: flex; align-items: center; gap: 6px; padding: 8px 16px;
-    background: var(--surface); border: 2px solid var(--border); box-shadow: var(--shadow);
-    font-family: var(--sans); font-size: 14px; font-weight: 600; cursor: pointer;
-    transition: transform 80ms, box-shadow 80ms;
-  }
-  .page-btn:hover:not(:disabled) { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--border); }
-  .page-btn:disabled { opacity: 0.35; pointer-events: none; }
+/* TOAST */
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:9px 15px;display:flex;align-items:center;gap:7px;font-size:13px;font-weight:500;border:2px solid #333;box-shadow:var(--sh-lg);z-index:9999;animation:su 180ms ease;white-space:nowrap}
+.toast-error{background:var(--danger)}
+@keyframes su{from{opacity:0;transform:translateX(-50%) translateY(8px)}}
 
-  /* ── Detail Panel ── */
-  .detail-panel {
-    max-width: 800px; margin: 0 auto; padding: 0 0 80px;
-    background: var(--surface); min-height: 100%;
-  }
-  .detail-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 20px; border-bottom: 2px solid var(--border);
-    position: sticky; top: 0; background: var(--surface); z-index: 5;
-  }
-  .detail-actions { display: flex; gap: 4px; }
-  .detail-subject {
-    font-size: 22px; font-weight: 700; padding: 20px 20px 16px; line-height: 1.3;
-  }
-  .detail-meta-row {
-    display: flex; align-items: center; gap: 12px;
-    padding: 0 20px 16px; border-bottom: 1px solid var(--border-light);
-  }
-  .detail-avatar {
-    width: 36px; height: 36px; background: var(--accent); color: white; border: 1.5px solid var(--border);
-    display: flex; align-items: center; justify-content: center; font-family: var(--mono);
-    font-size: 14px; font-weight: 700; flex-shrink: 0;
-  }
-  .detail-from-block { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
-  .detail-from-name { font-size: 14px; font-weight: 600; }
-  .detail-from-addr { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .detail-date { font-family: var(--mono); font-size: 12px; color: var(--text-3); flex-shrink: 0; }
-  .detail-body { padding: 24px 20px; }
-  .email-iframe { width: 100%; border: none; display: block; min-height: 200px; }
-  .email-text { white-space: pre-wrap; font-family: var(--mono); font-size: 13px; line-height: 1.7; color: var(--text); }
+/* SPIN */
+.spin{animation:sp 700ms linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
 
-  /* ── Reply ── */
-  .reply-box {
-    margin: 0 20px 24px; border: 2px solid var(--border); box-shadow: var(--shadow);
-    background: var(--surface);
-  }
-  .reply-header {
-    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
-    border-bottom: 2px solid var(--border); font-size: 13px; font-weight: 600;
-    background: var(--bg);
-  }
-  .ml-auto { margin-left: auto; }
-  .reply-textarea {
-    width: 100%; padding: 14px; border: none; outline: none; resize: vertical;
-    font-family: var(--sans); font-size: 14px; line-height: 1.6; background: var(--surface);
-  }
-  .reply-footer {
-    padding: 10px 14px; border-top: 1px solid var(--border-light); background: var(--bg);
-  }
+/* MOBILE NAV */
+.mob-nav{height:var(--mob-nav);border-top:2px solid var(--border);background:var(--surface);display:none;align-items:center;justify-content:space-around;flex-shrink:0;padding:0 4px}
+.mob-btn{display:flex;flex-direction:column;align-items:center;gap:2px;padding:5px 8px;background:none;border:none;cursor:pointer;color:var(--t3);font-size:9.5px;font-family:'DM Sans',sans-serif;font-weight:500;position:relative;transition:color 80ms;min-width:52px}
+.mob-active{color:var(--acc)!important}
+.mob-badge{position:absolute;top:1px;right:6px;background:var(--acc);color:#fff;border-radius:8px;font-size:8.5px;padding:0 4px;font-family:var(--mono);min-width:13px;text-align:center}
 
-  /* ── Compose Panel ── */
-  .compose-panel {
-    max-width: 720px; margin: 0 auto; padding: 0; background: var(--surface); min-height: 100%;
-  }
-  .compose-header {
-    display: flex; align-items: center; gap: 14px; padding: 14px 20px;
-    border-bottom: 2px solid var(--border); position: sticky; top: 0;
-    background: var(--surface); z-index: 5;
-  }
-  .compose-title { font-family: var(--mono); font-size: 16px; font-weight: 700; }
-  .compose-field {
-    display: flex; flex-direction: column; gap: 6px; padding: 14px 20px;
-    border-bottom: 1px solid var(--border-light);
-  }
-  .compose-field label { font-size: 12px; font-weight: 700; font-family: var(--mono); color: var(--text-2); letter-spacing: 0.5px; }
-  .compose-field input, .compose-field textarea {
-    border: 1.5px solid var(--border-light); background: var(--bg); border-radius: var(--radius);
-    padding: 9px 12px; font-family: var(--sans); font-size: 14px; color: var(--text); outline: none;
-    transition: border-color 100ms;
-  }
-  .compose-field input:focus, .compose-field textarea:focus { border-color: var(--border); background: var(--surface); }
-  .compose-body-field { flex: 1; }
-  .compose-body-field textarea { resize: none; flex: 1; }
-  .compose-footer {
-    display: flex; gap: 10px; align-items: center; padding: 14px 20px;
-    border-top: 2px solid var(--border); background: var(--surface);
-    position: sticky; bottom: 0;
-  }
-
-  /* ── Buttons ── */
-  .btn-primary {
-    display: flex; align-items: center; gap: 6px; padding: 9px 18px;
-    background: var(--accent); color: white; border: 2px solid var(--border);
-    box-shadow: var(--shadow); font-family: var(--sans); font-size: 14px; font-weight: 600;
-    cursor: pointer; transition: transform 80ms, box-shadow 80ms;
-  }
-  .btn-primary:hover:not(:disabled) { transform: translate(2px,2px); box-shadow: 1px 1px 0 var(--border); }
-  .btn-primary:disabled { opacity: 0.4; pointer-events: none; }
-  .btn-ghost {
-    display: flex; align-items: center; gap: 6px; padding: 9px 16px;
-    background: none; color: var(--text-2); border: 2px solid var(--border-light);
-    font-family: var(--sans); font-size: 14px; font-weight: 500; cursor: pointer;
-    border-radius: var(--radius);
-  }
-  .btn-ghost:hover { border-color: var(--border); color: var(--text); }
-
-  /* ── Toast ── */
-  .toast {
-    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-    background: var(--text); color: white; padding: 10px 18px;
-    display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 500;
-    border: 2px solid var(--border); box-shadow: var(--shadow-lg); z-index: 9999;
-    animation: slideUp 200ms ease;
-  }
-  .toast-success { background: #111; }
-  .toast-error { background: var(--warn); }
-  @keyframes slideUp { from { opacity: 0; transform: translateX(-50%) translateY(10px); } }
-
-  /* ── Spin ── */
-  .spin { animation: spin 700ms linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  /* ── Responsive ── */
-  @media (max-width: 700px) {
-    :root { --sidebar-w: 240px; }
-    .sidebar {
-      position: fixed; left: 0; top: 0; transform: translateX(-100%);
-      transition: transform 200ms ease;
-    }
-    .sidebar-open { transform: translateX(0); }
-    .sidebar-overlay { display: block; }
-    .mobile-menu-btn { display: flex; }
-    .row-sender { width: 110px; min-width: 110px; }
-    .row-snippet { display: none; }
-    .btn-compose span { display: none; }
-    .btn-compose { padding: 8px 10px; }
-    .detail-subject { font-size: 18px; }
-  }
+/* RESPONSIVE */
+@media(max-width:767px){
+  :root{--sb:260px}
+  .sidebar{position:fixed;left:0;top:0;transform:translateX(-100%)}
+  .sidebar.open{transform:translateX(0)}
+  .overlay{display:block}
+  .close-btn{display:flex}
+  .list-pane{width:100%;border-right:none;min-width:unset}
+  .mob-nav{display:flex}
+  .main{padding-bottom:var(--mob-nav)}
+  .panels{position:relative;overflow:hidden}
+  .det-wrap{position:absolute;inset:0;z-index:10;background:#fff;overflow-y:auto}
+  .det-subj{font-size:17px}
+}
+@media(max-width:900px) and (min-width:768px){
+  .list-pane{width:280px;min-width:240px}
+}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#ccc;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#aaa}
 `;
