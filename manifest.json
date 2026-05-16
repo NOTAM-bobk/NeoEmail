@@ -1,0 +1,14 @@
+{
+  "name": "NeoMail",
+  "short_name": "NeoMail",
+  "description": "Your Gmail. Faster. Better.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0052ff",
+  "orientation": "any",
+  "icons": [
+    { "src": "mail.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "mail.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
